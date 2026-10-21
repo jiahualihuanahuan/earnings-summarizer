@@ -1,0 +1,14 @@
+services:
+  earnings-app:
+    build: .
+    container_name: earnings-transcript-summarizer
+    ports:
+      - "8085:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://192.168.86.35:11434
+      - OLLAMA_MODEL=qwen3.5:9b
+      - SYNC_INTERVAL_HOURS=6
+      - DATABASE_PATH=/app/data/earnings.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
