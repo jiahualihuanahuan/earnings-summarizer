@@ -959,7 +959,7 @@ async def get_recent_sp500():
             FROM transcripts
             WHERE is_sp500 = 1
             ORDER BY report_date DESC, updated_at DESC
-            LIMIT 5
+            LIMIT 9
             """
         ).fetchall()
     return [dict(r) for r in rows]
