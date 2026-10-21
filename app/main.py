@@ -291,3 +291,707 @@ def scrape_fool_listing_pages(max_pages: int = 5) -> List[dict]:
             logger.warning(f"Error scraping Motley Fool listing page {page}: {e}")
 
     return discovered
+
+
+def parse_fool_transcript_article(url: str, fallback_symbol: str) -> Optional[dict]:
+    """Downloads and parses a full Motley Fool earnings call transcript into speaker turns."""
+    try:
+        resp = cf_requests.get(url, impersonate="chrome120", timeout=20)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        h1 = soup.find("h1")
+        title_text = h1.get_text(" ", strip=True) if h1 else ""
+        meta = parse_fool_url_metadata(url, title_text)
+        sym = fallback_symbol.upper() or meta["symbol"]
+
+        article = (
+            soup.find("div", {"class": re.compile(r"article-body|tailwind-article-body|content", re.I)})
+            or soup.find("article")
+            or soup.find("main")
+            or soup
+        )
+
+        paragraphs = article.find_all(["p", "h2", "h3", "li"])
+        segments = []
+        lines = []
+        current_speaker = "Transcript"
+        in_transcript_body = False
+
+        for p in paragraphs:
+            txt = p.get_text(" ", strip=True)
+            if not txt or len(txt) < 3:
+                continue
+
+            # Skip boilerplate footer/promo lines
+            if any(
+                skip in txt
+                for skip in [
+                    "Motley Fool Transcribing",
+                    "Image source: The Motley Fool",
+                    "Don't miss this second chance",
+                    "Stock Advisor",
+                    "has positions in",
+                ]
+            ):
+                continue
+
+            if "Full Conference Call Transcript" in txt or "Prepared Remarks" in txt:
+                in_transcript_body = True
+                continue
+
+            # Detect standalone speaker header: e.g. "Larry Culp -- Chairman and CEO"
+            strong = p.find("strong")
+            if strong and len(txt) < 120 and ("--" in txt or "—" in txt or "-" in txt):
+                current_speaker = strong.get_text(" ", strip=True).rstrip(":")
+                in_transcript_body = True
+                continue
+
+            # Detect inline speaker: e.g. "Larry Culp: Thank you..." or "Operator: Good day..."
+            inline_match = re.match(r"^([A-Z][A-Za-z0-9\s.\-',()]{1,45}):\s+(.+)$", txt)
+            if inline_match:
+                current_speaker = inline_match.group(1).strip()
+                content = inline_match.group(2).strip()
+                in_transcript_body = True
+            else:
+                if len(txt) < 25 and not in_transcript_body:
+                    continue
+                content = txt
+
+            if len(content) >= 15:
+                seg_idx = len(segments) + 1
+                segments.append(
+                    {
+                        "paragraph_number": seg_idx,
+                        "speaker": current_speaker,
+                        "content": content,
+                    }
+                )
+                lines.append(f"[{current_speaker}]: {content}")
+
+        if len(segments) < 5:
+            return None
+
+        return {
+            "symbol": sym,
+            "fiscal_year": meta["fiscal_year"],
+            "fiscal_quarter": meta["fiscal_quarter"],
+            "report_date": meta["report_date"],
+            "source": "The Motley Fool (Verbatim Transcript)",
+            "segments": segments,
+            "raw_text": "\n\n".join(lines),
+        }
+    except Exception as e:
+        logger.warning(f"Failed parsing Motley Fool article {url}: {e}")
+        return None
+
+
+def find_fool_transcript_for_symbol(symbol: str) -> Optional[dict]:
+    """Resolves the latest Motley Fool transcript for any ticker via Feed, Quote Page, or Search."""
+    sym = symbol.upper()
+    slug_sym = sym.lower().replace(".", "-")
+
+    # 1. Check recent listing pages (fast path for newly reported earnings like GE)
+    recent_items = scrape_fool_listing_pages(max_pages=3)
+    for item in recent_items:
+        if item["symbol"] == sym:
+            parsed = parse_fool_transcript_article(item["url"], sym)
+            if parsed:
+                return parsed
+
+    # 2. Check Motley Fool Quote pages (NYSE & NASDAQ)
+    for exchange in ["nyse", "nasdaq", "nysemkt"]:
+        quote_url = f"https://www.fool.com/quote/{exchange}/{slug_sym}/"
+        try:
+            resp = cf_requests.get(quote_url, impersonate="chrome120", timeout=12)
+            if resp.status_code == 200 and "/earnings/call-transcripts/" in resp.text:
+                matches = re.findall(
+                    r'(?:https://www\.fool\.com)?(/earnings/call-transcripts/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/)',
+                    resp.text,
+                    re.I,
+                )
+                for path in matches:
+                    if f"-{slug_sym}-" in path.lower():
+                        full_url = f"https://www.fool.com{path}"
+                        parsed = parse_fool_transcript_article(full_url, sym)
+                        if parsed:
+                            return parsed
+        except Exception:
+            pass
+
+    # 3. Search Engine Resolver (Yahoo Search / DuckDuckGo HTML) for older quarters
+    search_queries = [
+        f'site:fool.com/earnings/call-transcripts/ "({sym})" "Earnings Call Transcript"',
+        f'site:fool.com/earnings/call-transcripts/ "{sym}" earnings call transcript',
+    ]
+    for q in search_queries:
+        try:
+            s_url = f"https://search.yahoo.com/search?p={quote_plus(q)}"
+            resp = cf_requests.get(s_url, impersonate="chrome120", timeout=12)
+            if resp.status_code == 200:
+                raw_html = unquote(resp.text)
+                urls = re.findall(
+                    r"https://www\.fool\.com/earnings/call-transcripts/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/",
+                    raw_html,
+                    re.I,
+                )
+                # Sort descending by date in URL path (/YYYY/MM/DD/)
+                urls = sorted(set(urls), reverse=True)
+                for candidate_url in urls:
+                    if f"-{slug_sym}-" in candidate_url.lower():
+                        parsed = parse_fool_transcript_article(candidate_url, sym)
+                        if parsed:
+                            return parsed
+        except Exception as e:
+            logger.warning(f"Search resolver failed for {sym}: {e}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Engine 2: Yahoo Finance Live Transcript Extractor (HTML + SvelteKit JSON + Search)
+# ---------------------------------------------------------------------------
+def fetch_transcript_from_yahoo_live(symbol: str) -> Optional[dict]:
+    sym = symbol.upper()
+    candidate_urls = []
+
+    # 1. Inspect both finance.yahoo.com and stage.finance.yahoo.com earnings-calls page
+    for host in ["https://finance.yahoo.com", "https://stage.finance.yahoo.com"]:
+        list_url = f"{host}/quote/{sym}/earnings-calls/"
+        try:
+            resp = cf_requests.get(list_url, impersonate="chrome120", timeout=15)
+            if resp.status_code == 200:
+                matches = re.findall(
+                    r'(?:https?://(?:stage\.)?finance\.yahoo\.com)?(/quote/[A-Za-z0-9.\-]+/earnings/[A-Za-z0-9.\-_]+earnings_call[A-Za-z0-9.\-_]*\.html)',
+                    resp.text,
+                    re.I,
+                )
+                for m in matches:
+                    candidate_urls.append(f"https://finance.yahoo.com{m}")
+        except Exception:
+            pass
+
+    # 2. Fallback: Yahoo Search index for direct Yahoo Finance transcript URLs
+    if not candidate_urls:
+        try:
+            q = f'site:finance.yahoo.com/quote/{sym}/earnings/ "earnings_call"'
+            s_resp = cf_requests.get(
+                f"https://search.yahoo.com/search?p={quote_plus(q)}",
+                impersonate="chrome120",
+                timeout=12,
+            )
+            if s_resp.status_code == 200:
+                raw_html = unquote(s_resp.text)
+                found = re.findall(
+                    r"https?://(?:stage\.)?finance\.yahoo\.com/quote/[A-Za-z0-9.\-]+/earnings/[A-Za-z0-9.\-_]+\.html",
+                    raw_html,
+                    re.I,
+                )
+                candidate_urls.extend(found)
+        except Exception:
+            pass
+
+    for full_url in candidate_urls:
+        try:
+            t_resp = cf_requests.get(full_url, impersonate="chrome120", timeout=15)
+            if t_resp.status_code != 200:
+                continue
+            t_soup = BeautifulSoup(t_resp.text, "lxml")
+            article = (
+                t_soup.find("article")
+                or t_soup.find("div", {"class": re.compile(r"caas-body|body|transcript", re.I)})
+                or t_soup
+            )
+            paragraphs = article.find_all("p")
+            segments = []
+            lines = []
+            for idx, p in enumerate(paragraphs, 1):
+                txt = p.get_text(" ", strip=True)
+                if len(txt) < 25:
+                    continue
+                speaker = "Speaker"
+                content = txt
+                if ":" in txt[:65]:
+                    parts = txt.split(":", 1)
+                    speaker = parts[0].strip()
+                    content = parts[1].strip()
+                segments.append({"paragraph_number": idx, "speaker": speaker, "content": content})
+                lines.append(f"[{speaker}]: {content}")
+
+            if len(segments) >= 5:
+                m = re.search(r"Q([1-4])-(\d{4})", full_url, re.I)
+                fq = int(m.group(1)) if m else ((datetime.now().month - 1) // 3 + 1)
+                fy = int(m.group(2)) if m else datetime.now().year
+                return {
+                    "symbol": sym,
+                    "fiscal_year": fy,
+                    "fiscal_quarter": fq,
+                    "report_date": datetime.now().strftime("%Y-%m-%d"),
+                    "source": "Yahoo Finance (Live Direct)",
+                    "segments": segments,
+                    "raw_text": "\n\n".join(lines),
+                }
+        except Exception as e:
+            logger.warning(f"Yahoo transcript parse failed on {full_url}: {e}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Engine 3: DuckDB Parquet Archive Fallback (with custom_user_agent & HF_TOKEN)
+# ---------------------------------------------------------------------------
+def configure_duckdb_con():
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute(f"SET custom_user_agent = '{BROWSER_UA}';")
+    con.execute("SET http_keep_alive = false;")
+    if HF_TOKEN:
+        con.execute(
+            f"""
+            CREATE SECRET hf_secret (
+                TYPE HTTP,
+                EXTRA_HTTP_HEADERS MAP {{'Authorization': 'Bearer {HF_TOKEN}'}}
+            );
+            """
+        )
+    return con
+
+
+def fetch_transcript_from_parquet(
+    symbol: str, fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = None
+) -> Optional[dict]:
+    try:
+        con = configure_duckdb_con()
+        if fiscal_year and fiscal_quarter:
+            query = f"""
+                SELECT symbol, fiscal_year, fiscal_quarter, report_date, to_json(transcripts)
+                FROM '{HF_TRANSCRIPTS_PARQUET}'
+                WHERE symbol = ? AND fiscal_year = ? AND fiscal_quarter = ?
+                LIMIT 1
+            """
+            row = con.execute(query, [symbol.upper(), fiscal_year, fiscal_quarter]).fetchone()
+        else:
+            query = f"""
+                SELECT symbol, fiscal_year, fiscal_quarter, report_date, to_json(transcripts)
+                FROM '{HF_TRANSCRIPTS_PARQUET}'
+                WHERE symbol = ?
+                ORDER BY report_date DESC
+                LIMIT 1
+            """
+            row = con.execute(query, [symbol.upper()]).fetchone()
+        con.close()
+
+        if not row:
+            return None
+
+        segments = json.loads(row[4]) if row[4] else []
+        lines = [
+            f"[{seg.get('speaker', 'Speaker')}]: {seg.get('content', '')}" for seg in segments
+        ]
+        raw_text = "\n\n".join(lines)
+        if not raw_text.strip():
+            return None
+
+        return {
+            "symbol": row[0],
+            "fiscal_year": int(row[1]),
+            "fiscal_quarter": int(row[2]),
+            "report_date": str(row[3]),
+            "source": "Yahoo Finance (Parquet Archive)",
+            "segments": segments,
+            "raw_text": raw_text,
+        }
+    except Exception as e:
+        logger.warning(f"Parquet archive fallback skipped for {symbol}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Local LLM Summarizer (Ollama @ 192.168.86.35:11434)
+# ---------------------------------------------------------------------------
+async def get_available_ollama_models() -> List[str]:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                return [m["name"] for m in data.get("models", [])]
+    except Exception as e:
+        logger.warning(f"Could not reach Ollama at {OLLAMA_BASE_URL}: {e}")
+    return []
+
+
+async def resolve_ollama_model(preferred: Optional[str] = None) -> str:
+    target = preferred or DEFAULT_OLLAMA_MODEL
+    models = await get_available_ollama_models()
+    if not models:
+        return target
+    if target in models:
+        return target
+    for m in models:
+        if m.startswith(target.split(":")[0]):
+            return m
+    return models[0]
+
+
+async def summarize_with_ollama(
+    company_name: str,
+    symbol: str,
+    fiscal_year: int,
+    fiscal_quarter: int,
+    raw_text: str,
+    model_override: Optional[str] = None,
+) -> dict:
+    model = await resolve_ollama_model(model_override)
+
+    max_chars = 42000
+    if len(raw_text) > max_chars:
+        half = max_chars // 2
+        trimmed_text = (
+            raw_text[:half]
+            + "\n\n[... Middle section condensed for context window ...]\n\n"
+            + raw_text[-half:]
+        )
+    else:
+        trimmed_text = raw_text
+
+    system_prompt = (
+        "You are a senior equity research analyst. Analyze the provided earnings call transcript "
+        "and respond using the exact XML tags below. Do not omit the tags.\n\n"
+        "<SENTIMENT>Bullish, Neutral, or Bearish</SENTIMENT>\n"
+        "<SNIPPET>\n"
+        "Write a punchy 2-3 sentence executive summary (max 70 words) suitable for a dashboard card. "
+        "State key revenue/EPS performance, primary growth catalyst, and forward guidance tone.\n"
+        "</SNIPPET>\n"
+        "<SUMMARY>\n"
+        "### 1. Executive Summary & Headline Performance\n"
+        "- Key takeaways, top/bottom-line highlights, and management tone.\n\n"
+        "### 2. Forward Guidance & Financial Outlook\n"
+        "- Specific revenue, margin, EPS, or CapEx guidance changes mentioned.\n\n"
+        "### 3. Segment & Product Highlights\n"
+        "- Performance broken down by business unit, geography, or product line.\n\n"
+        "### 4. Headwinds, Risks & Margin Pressures\n"
+        "- Macro challenges, supply chain, FX, or competitive pressures.\n\n"
+        "### 5. Analyst Q&A Takeaways\n"
+        "- Key questions where analysts pressed management and how executives responded.\n"
+        "</SUMMARY>"
+    )
+
+    user_prompt = (
+        f"Company: {company_name} ({symbol})\n"
+        f"Period: Q{fiscal_quarter} {fiscal_year}\n\n"
+        f"TRANSCRIPT:\n{trimmed_text}"
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_ctx": 16384,
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "")
+
+        clean_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+        sentiment_match = re.search(r"<SENTIMENT>(.*?)</SENTIMENT>", clean_content, re.DOTALL | re.I)
+        snippet_match = re.search(r"<SNIPPET>(.*?)</SNIPPET>", clean_content, re.DOTALL | re.I)
+        summary_match = re.search(r"<SUMMARY>(.*?)</SUMMARY>", clean_content, re.DOTALL | re.I)
+
+        sentiment = sentiment_match.group(1).strip() if sentiment_match else "Neutral"
+        if "bull" in sentiment.lower():
+            sentiment = "Bullish"
+        elif "bear" in sentiment.lower():
+            sentiment = "Bearish"
+        else:
+            sentiment = "Neutral"
+
+        snippet = (
+            snippet_match.group(1).strip()
+            if snippet_match
+            else clean_content[:280].replace("#", "").strip() + "..."
+        )
+        summary_md = summary_match.group(1).strip() if summary_match else clean_content
+
+        return {
+            "sentiment": sentiment,
+            "snippet": snippet,
+            "summary_markdown": summary_md,
+            "model_used": model,
+        }
+    except Exception as e:
+        logger.error(f"Ollama summarization error ({OLLAMA_BASE_URL}): {e}")
+        return {
+            "sentiment": "Neutral",
+            "snippet": f"Transcript retrieved ({len(raw_text):,} chars), but local LLM at {OLLAMA_BASE_URL} was unreachable ({e}). Click Re-Summarize once Ollama is online.",
+            "summary_markdown": f"⚠️ **Local LLM Connection Error:** Could not summarize via `{OLLAMA_BASE_URL}` (`{e}`).\n\nFull transcript is available in the **Verbatim Transcript** tab.",
+            "model_used": model,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Core Pipeline: Fetch + Summarize + Persist
+# ---------------------------------------------------------------------------
+async def process_company_transcript(
+    symbol: str,
+    fiscal_year: Optional[int] = None,
+    fiscal_quarter: Optional[int] = None,
+    force_resummarize: bool = False,
+    model_override: Optional[str] = None,
+    direct_fool_url: Optional[str] = None,
+) -> dict:
+    comp = resolve_company(symbol) or {"symbol": symbol.upper(), "name": symbol.upper(), "is_sp500": 0}
+    sym = comp["symbol"]
+
+    if not force_resummarize and not (fiscal_year and fiscal_quarter) and not direct_fool_url:
+        with get_db() as conn:
+            cached = conn.execute(
+                "SELECT * FROM transcripts WHERE symbol = ? ORDER BY report_date DESC LIMIT 1",
+                (sym,),
+            ).fetchone()
+            if cached and cached["summary_markdown"] and not cached["summary_markdown"].startswith("⚠️"):
+                return dict(cached)
+
+    t_data = None
+
+    # 1. If a direct Motley Fool transcript URL was discovered during feed sync, use it first
+    if direct_fool_url:
+        t_data = await asyncio.to_thread(parse_fool_transcript_article, direct_fool_url, sym)
+
+    # 2. Tier 1: Motley Fool Live Resolver (Feed + Quote Page + Search)
+    if not t_data:
+        t_data = await asyncio.to_thread(find_fool_transcript_for_symbol, sym)
+
+    # 3. Tier 2: Yahoo Finance Live Direct Scraper
+    if not t_data:
+        t_data = await asyncio.to_thread(fetch_transcript_from_yahoo_live, sym)
+
+    # 4. Tier 3: DuckDB Hugging Face Parquet Archive
+    if not t_data:
+        t_data = await asyncio.to_thread(fetch_transcript_from_parquet, sym, fiscal_year, fiscal_quarter)
+
+    if not t_data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No earnings call transcript found across Motley Fool or Yahoo Finance for {sym}.",
+        )
+
+    fy = t_data["fiscal_year"]
+    fq = t_data["fiscal_quarter"]
+    record_id = f"{sym}_{fy}_Q{fq}"
+
+    if not force_resummarize:
+        with get_db() as conn:
+            existing = conn.execute("SELECT * FROM transcripts WHERE id = ?", (record_id,)).fetchone()
+            if existing and existing["summary_markdown"] and not existing["summary_markdown"].startswith("⚠️"):
+                return dict(existing)
+
+    llm_res = await summarize_with_ollama(
+        company_name=comp["name"],
+        symbol=sym,
+        fiscal_year=fy,
+        fiscal_quarter=fq,
+        raw_text=t_data["raw_text"],
+        model_override=model_override,
+    )
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    record = {
+        "id": record_id,
+        "symbol": sym,
+        "company_name": comp["name"],
+        "fiscal_year": fy,
+        "fiscal_quarter": fq,
+        "report_date": t_data["report_date"],
+        "source": t_data["source"],
+        "is_sp500": comp["is_sp500"],
+        "raw_text": t_data["raw_text"],
+        "segments_json": json.dumps(t_data["segments"]),
+        "sentiment": llm_res["sentiment"],
+        "snippet": llm_res["snippet"],
+        "summary_markdown": llm_res["summary_markdown"],
+        "model_used": llm_res["model_used"],
+        "updated_at": now_str,
+    }
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO transcripts (
+                id, symbol, company_name, fiscal_year, fiscal_quarter, report_date,
+                source, is_sp500, raw_text, segments_json, sentiment, snippet,
+                summary_markdown, model_used, updated_at
+            ) VALUES (
+                :id, :symbol, :company_name, :fiscal_year, :fiscal_quarter, :report_date,
+                :source, :is_sp500, :raw_text, :segments_json, :sentiment, :snippet,
+                :summary_markdown, :model_used, :model_used
+            )
+            """.replace(":model_used, :model_used", ":model_used, :updated_at"),
+            record,
+        )
+        conn.commit()
+
+    return record
+
+
+async def sync_recent_sp500_job():
+    """Finds the 9 most recent S&P 500 earnings calls from live transcript feeds and summarizes them."""
+    if sync_status["running"]:
+        return
+    sync_status["running"] = True
+    sync_status["message"] = "Scanning live transcript feeds for the 9 newest S&P 500 calls..."
+    logger.info(sync_status["message"])
+
+    try:
+        sp500_set = get_sp500_set()
+        discovered = await asyncio.to_thread(scrape_fool_listing_pages, 9)
+
+        sp500_candidates = []
+        seen_syms = set()
+        for item in discovered:
+            sym = item["symbol"]
+            if sym in sp500_set and sym not in seen_syms:
+                seen_syms.add(sym)
+                sp500_candidates.append(item)
+            if len(sp500_candidates) >= 9:
+                break
+
+        # Fallback seed tickers if fewer than 9 S&P 500 companies appeared in recent pages
+        for fallback_sym in ["MSFT", "NFLX", "RTX", "JPM", "TSLA", "NVDA", "AAPL","META","GOOGL"]:
+            if len(sp500_candidates) >= 9:
+                break
+            if fallback_sym not in seen_syms:
+                seen_syms.add(fallback_sym)
+                sp500_candidates.append({"symbol": fallback_sym, "url": None})
+
+        for idx, item in enumerate(sp500_candidates[:9], 1):
+            sym = item["symbol"]
+            sync_status["message"] = f"Processing ({idx}/9): {sym} via Ollama ({OLLAMA_BASE_URL})..."
+            logger.info(sync_status["message"])
+            try:
+                await process_company_transcript(
+                    sym,
+                    force_resummarize=False,
+                    direct_fool_url=item.get("url"),
+                )
+            except Exception as inner_e:
+                logger.warning(f"Failed syncing S&P 500 item {sym}: {inner_e}")
+
+        sync_status["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sync_status["message"] = "Up to date"
+    except Exception as e:
+        logger.error(f"S&P 500 background sync failed: {e}")
+        sync_status["message"] = f"Sync error: {e}"
+    finally:
+        sync_status["running"] = False
+
+
+# ---------------------------------------------------------------------------
+# FastAPI Lifespan & Endpoints
+# ---------------------------------------------------------------------------
+scheduler = AsyncIOScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    await seed_companies()
+    scheduler.add_job(sync_recent_sp500_job, "interval", hours=SYNC_INTERVAL_HOURS)
+    scheduler.start()
+    asyncio.create_task(sync_recent_sp500_job())
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="S&P 500 Earnings Call AI Summarizer", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse("app/static/index.html")
+
+
+@app.get("/api/status")
+async def api_status():
+    models = await get_available_ollama_models()
+    active_model = await resolve_ollama_model()
+    return {
+        "ollama_url": OLLAMA_BASE_URL,
+        "ollama_online": len(models) > 0,
+        "available_models": models,
+        "active_model": active_model,
+        "sync_status": sync_status,
+    }
+
+
+@app.get("/api/recent-sp500")
+async def get_recent_sp500():
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, symbol, company_name, fiscal_year, fiscal_quarter,
+                   report_date, source, sentiment, snippet, model_used, updated_at
+            FROM transcripts
+            WHERE is_sp500 = 1
+            ORDER BY report_date DESC, updated_at DESC
+            LIMIT 5
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/sync-sp500")
+async def trigger_sp500_sync(background_tasks: BackgroundTasks):
+    if not sync_status["running"]:
+        background_tasks.add_task(sync_recent_sp500_job)
+    return {"status": "started", "sync_status": sync_status}
+
+
+@app.get("/api/search-companies")
+async def search_companies(q: str = Query(..., min_length=1)):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol, name, is_sp500
+            FROM companies
+            WHERE UPPER(symbol) LIKE UPPER(?) OR UPPER(name) LIKE UPPER(?)
+            ORDER BY
+                CASE WHEN UPPER(symbol) = UPPER(?) THEN 0
+                     WHEN UPPER(symbol) LIKE UPPER(?) THEN 1
+                     ELSE 2 END,
+                is_sp500 DESC,
+                LENGTH(symbol) ASC
+            LIMIT 10
+            """,
+            (f"{q}%", f"%{q}%", q, f"{q}%"),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/transcript/{query_str}")
+async def get_or_fetch_transcript(
+    query_str: str,
+    force: bool = False,
+    model: Optional[str] = None,
+):
+    comp = resolve_company(query_str)
+    if not comp:
+        raise HTTPException(status_code=404, detail=f"Company '{query_str}' not found.")
+    record = await process_company_transcript(
+        comp["symbol"],
+        force_resummarize=force,
+        model_override=model,
+    )
+    return record
