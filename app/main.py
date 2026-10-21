@@ -222,3 +222,72 @@ def resolve_company(query_str: str) -> Optional[dict]:
     if re.match(r"^[A-Za-z.\-]{1,6}$", q):
         return {"symbol": q.upper(), "name": q.upper(), "is_sp500": 0}
     return None
+
+
+# ---------------------------------------------------------------------------
+# Engine 1: The Motley Fool Live Transcripts (Feed + Quote Page + Search)
+# ---------------------------------------------------------------------------
+def parse_fool_url_metadata(url: str, link_text: str = "") -> dict:
+    """Extracts symbol, quarter, year, and report_date from a Motley Fool transcript URL/title."""
+    # Example URL: /earnings/call-transcripts/2026/10/20/ge-ge-q3-2026-earnings-call-transcript/
+    date_match = re.search(r"/call-transcripts/(\d{4})/(\d{2})/(\d{2})/", url)
+    report_date = (
+        f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
+        if date_match
+        else datetime.now().strftime("%Y-%m-%d")
+    )
+
+    q_match = re.search(r"-q([1-4])-(\d{4})-earnings", url, re.I) or re.search(
+        r"Q([1-4])\s+(\d{4})", link_text, re.I
+    )
+    fq = int(q_match.group(1)) if q_match else ((datetime.now().month - 1) // 3 + 1)
+    fy = int(q_match.group(2)) if q_match else datetime.now().year
+
+    # Extract ticker from title like "GE (GE) Q3 2026" or slug like "...-ge-q3-2026-..."
+    sym = None
+    t_match = re.search(r"\(([A-Z.\-]{1,6})\)", link_text)
+    if t_match:
+        sym = t_match.group(1).upper()
+    else:
+        slug_match = re.search(r"/([a-z0-9\-]+)-q[1-4]-\d{4}-earnings", url, re.I)
+        if slug_match:
+            parts = slug_match.group(1).split("-")
+            if parts:
+                sym = parts[-1].upper()
+
+    return {
+        "symbol": sym,
+        "fiscal_year": fy,
+        "fiscal_quarter": fq,
+        "report_date": report_date,
+    }
+
+
+def scrape_fool_listing_pages(max_pages: int = 5) -> List[dict]:
+    """Walks https://www.fool.com/earnings-call-transcripts/ to discover recent transcripts."""
+    discovered = []
+    seen_urls = set()
+
+    for page in range(1, max_pages + 1):
+        url = f"https://www.fool.com/earnings-call-transcripts/?page={page}"
+        try:
+            resp = cf_requests.get(url, impersonate="chrome120", timeout=15)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/earnings/call-transcripts/" not in href:
+                    continue
+                full_url = href if href.startswith("http") else f"https://www.fool.com{href}"
+                if full_url in seen_urls:
+                    continue
+                text = a.get_text(" ", strip=True)
+                meta = parse_fool_url_metadata(full_url, text)
+                if meta["symbol"]:
+                    seen_urls.add(full_url)
+                    discovered.append({**meta, "url": full_url, "title": text})
+        except Exception as e:
+            logger.warning(f"Error scraping Motley Fool listing page {page}: {e}")
+
+    return discovered
