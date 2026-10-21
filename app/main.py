@@ -845,17 +845,23 @@ async def process_company_transcript(
     return record
 
 
+RECENT_SP500_LIMIT = int(os.getenv("RECENT_SP500_LIMIT", "9"))
+
+
 async def sync_recent_sp500_job():
     """Finds the 9 most recent S&P 500 earnings calls from live transcript feeds and summarizes them."""
     if sync_status["running"]:
         return
     sync_status["running"] = True
-    sync_status["message"] = "Scanning live transcript feeds for the 9 newest S&P 500 calls..."
+    sync_status["message"] = (
+        f"Scanning live transcript feeds for the {RECENT_SP500_LIMIT} newest S&P 500 calls..."
+    )
     logger.info(sync_status["message"])
 
     try:
         sp500_set = get_sp500_set()
-        discovered = await asyncio.to_thread(scrape_fool_listing_pages, 9)
+        # Scan up to 8 pages to ensure we capture at least 9 S&P 500 constituents
+        discovered = await asyncio.to_thread(scrape_fool_listing_pages, 8)
 
         sp500_candidates = []
         seen_syms = set()
@@ -864,20 +870,27 @@ async def sync_recent_sp500_job():
             if sym in sp500_set and sym not in seen_syms:
                 seen_syms.add(sym)
                 sp500_candidates.append(item)
-            if len(sp500_candidates) >= 9:
+            if len(sp500_candidates) >= RECENT_SP500_LIMIT:
                 break
 
         # Fallback seed tickers if fewer than 9 S&P 500 companies appeared in recent pages
-        for fallback_sym in ["MSFT", "NFLX", "RTX", "JPM", "TSLA", "NVDA", "AAPL","META","GOOGL"]:
-            if len(sp500_candidates) >= 9:
+        fallback_list = [
+            "GE", "NFLX", "RTX", "COF", "MSCI", "STLD",
+            "GPC", "JPM", "TSLA", "NVDA", "AAPL", "MSFT",
+        ]
+        for fallback_sym in fallback_list:
+            if len(sp500_candidates) >= RECENT_SP500_LIMIT:
                 break
             if fallback_sym not in seen_syms:
                 seen_syms.add(fallback_sym)
                 sp500_candidates.append({"symbol": fallback_sym, "url": None})
 
-        for idx, item in enumerate(sp500_candidates[:9], 1):
+        total = RECENT_SP500_LIMIT
+        for idx, item in enumerate(sp500_candidates[:total], 1):
             sym = item["symbol"]
-            sync_status["message"] = f"Processing ({idx}/9): {sym} via Ollama ({OLLAMA_BASE_URL})..."
+            sync_status["message"] = (
+                f"Processing ({idx}/{total}): {sym} via Ollama ({OLLAMA_BASE_URL})..."
+            )
             logger.info(sync_status["message"])
             try:
                 await process_company_transcript(
