@@ -2,13 +2,13 @@
 
 Local-first S&P 500 earnings call transcript fetcher and AI summarizer.
 
-Pulls recent earnings call transcripts, stores them, and generates concise key-point summaries using a local Ollama model (default: Qwen3.5 9B). Built for Canadian/US passive investors who want structured insights without sending transcripts to the cloud.
+Pulls recent earnings call transcripts, stores them, and generates concise key-point summaries using a local OpenAI-compatible LLM (default: vLLM serving Qwen/Qwen3-8B-AWQ). Built for Canadian/US passive investors who want structured insights without sending transcripts to the cloud.
 
 ## Features
 
 - **Auto-discovery** of recent S&P 500 earnings calls from The Motley Fool transcript listings
 - **Verbatim transcript parsing** into speaker turns
-- **Local LLM summarization** via Ollama (sentiment + snippet + markdown key points)
+- **Local LLM summarization** via vLLM / OpenAI-compatible API (sentiment + snippet + markdown key points)
 - **Background sync** every N hours for the newest S&P 500 calls
 - **Search any company** by ticker or name
 - **Clean dark-mode web UI** (Tailwind) with summary / full transcript tabs
@@ -18,7 +18,8 @@ Pulls recent earnings call transcripts, stores them, and generates concise key-p
 ## Prerequisites
 
 - Docker & Docker Compose (recommended), **or** Python 3.11+
-- A running [Ollama](https://ollama.com) instance with a model pulled (e.g. `qwen3.5:9b`, `qwen2.5:7b`, `llama3.1:8b`)
+- A running [vLLM](https://docs.vllm.ai) (or other OpenAI-compatible) server with model `Qwen/Qwen3-8B-AWQ`
+  - Example start: `vllm serve Qwen/Qwen3-8B-AWQ --port 8001 --api-key vllm-secret-key`
 - Network access to Motley Fool and (optionally) Hugging Face for ticker catalogs
 
 ## Quick Start (Docker)
@@ -29,7 +30,7 @@ Pulls recent earnings call transcripts, stores them, and generates concise key-p
    cd earnings-summarizer
    ```
 
-2. Edit `docker-compose.yml` and set `OLLAMA_BASE_URL` to your Ollama host (default assumes `http://192.168.86.35:11434`).
+2. Edit `docker-compose.yml` if needed and set `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` to match your vLLM host (defaults assume `http://192.168.86.35:8001/v1` with key `vllm-secret-key`).
 
 3. Start:
    ```bash
@@ -48,8 +49,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Set environment variables (optional)
-export OLLAMA_BASE_URL=http://localhost:11434
-export OLLAMA_MODEL=qwen3.5:9b
+export LLM_BASE_URL=http://192.168.86.35:8001/v1
+export LLM_API_KEY=vllm-secret-key
+export LLM_MODEL=Qwen/Qwen3-8B-AWQ
 export DATABASE_PATH=./data/earnings.db
 
 # Run
@@ -62,8 +64,11 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_BASE_URL` | `http://192.168.86.35:11434` | Base URL of your Ollama server |
-| `OLLAMA_MODEL` | `qwen3.5:9b` | Model name to use for summarization |
+| `LLM_BASE_URL` | `http://192.168.86.35:8001/v1` | Base URL of your OpenAI-compatible vLLM server |
+| `LLM_API_KEY` | `vllm-secret-key` | API key for the vLLM server |
+| `LLM_MODEL` | `Qwen/Qwen3-8B-AWQ` | Model name to use for summarization |
+| `OLLAMA_BASE_URL` | (empty) | Optional Ollama fallback URL |
+| `OLLAMA_MODEL` | `qwen3.5:9b` | Optional Ollama fallback model |
 | `SYNC_INTERVAL_HOURS` | `6` | How often the background S&P 500 sync runs |
 | `DATABASE_PATH` | `/app/data/earnings.db` | SQLite database path |
 | `HF_TOKEN` | (empty) | Optional Hugging Face token (for higher rate limits) |
@@ -71,7 +76,7 @@ Environment variables:
 ## API Endpoints
 
 - `GET /` — Web UI
-- `GET /api/status` — Ollama connectivity + current sync status
+- `GET /api/status` — LLM connectivity + current sync status
 - `GET /api/recent-sp500` — Latest summarized S&P 500 earnings calls
 - `POST /api/sync-sp500` — Trigger a background sync immediately
 - `GET /api/search-companies?q=` — Company autocomplete
@@ -81,7 +86,7 @@ Environment variables:
 
 - **FastAPI** backend (`app/main.py`)
 - **Motley Fool scraper** (curl_cffi + BeautifulSoup) for live transcripts
-- **Ollama** for local summarization (structured output with `<SENTIMENT>`, `<SNIPPET>`, `<SUMMARY>`)
+- **vLLM / OpenAI-compatible** for local summarization (structured output with `<SENTIMENT>`, `<SNIPPET>`, `<SUMMARY>`)
 - **SQLite** for companies and transcripts
 - **APScheduler** for periodic S&P 500 sync
 - **Static frontend** (`app/static/index.html`) with Tailwind + marked.js
