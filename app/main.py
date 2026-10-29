@@ -253,6 +253,14 @@ def _parse_generic_transcript_html(html: str, sym: str, source_label: str, title
         txt = p.get_text(" ", strip=True)
         if not txt:
             continue
+        cls = " ".join(p.get("class") or [])
+        if "section-title" in cls:
+            st = p.find("strong")
+            if st and "presentation-section" in cls:
+                current_speaker = st.get_text(" ", strip=True)
+            continue
+        if "participants" in cls or "section-separator" in cls:
+            continue
         inline = re.match(r"^([A-Z][A-Za-z0-9\s.\-',()]{1,45}):\s+(.+)$", txt)
         strong = p.find("strong")
         if strong and len(txt) < 120 and strong.get_text(strip=True) == txt:
@@ -296,15 +304,26 @@ def find_seeking_alpha_transcript_for_symbol(symbol: str) -> Optional[dict]:
             if "earnings call transcript" not in title.lower():
                 continue
             art_id = item.get("id")
-            a_resp = cf_requests.get(
-                f"https://seekingalpha.com/api/v3/articles/{art_id}", impersonate="chrome120", timeout=20
-            )
-            if a_resp.status_code != 200:
+            a_resp = None
+            for imp in ("chrome120", "chrome124", "safari17_0"):
+                a_resp = cf_requests.get(
+                    f"https://seekingalpha.com/api/v3/articles/{art_id}?include=author",
+                    impersonate=imp,
+                    timeout=20,
+                    headers={"Referer": "https://seekingalpha.com/", "Accept": "application/json"},
+                )
+                if a_resp.status_code == 200 and a_resp.text.lstrip().startswith('{"data"'):
+                    break
+                logger.info(f"Seeking Alpha article {art_id} blocked (HTTP {a_resp.status_code}) via {imp}")
+            if not a_resp or a_resp.status_code != 200:
                 continue
             content = ((a_resp.json().get("data") or {}).get("attributes") or {}).get("content", "")
             parsed = _parse_generic_transcript_html(content, sym, "Seeking Alpha (Transcript)", title)
-            if parsed:
+            # Unauthenticated API returns only a short teaser for paywalled transcripts
+            if parsed and len(parsed["segments"]) >= 25 and len(parsed["raw_text"]) >= 8000:
                 return parsed
+            logger.info(f"Seeking Alpha {sym} transcript {art_id} is paywalled/teaser only ({len(content)} chars); falling back")
+            return None
     except Exception as e:
         logger.warning(f"Seeking Alpha lookup failed for {sym}: {e}")
     return None
@@ -317,7 +336,8 @@ def find_benzinga_transcript_for_symbol(symbol: str) -> Optional[dict]:
     try:
         url = f"https://www.benzinga.com/quote/{sym}/earnings-call-transcripts"
         resp = cf_requests.get(url, impersonate="chrome120", timeout=15)
-        if resp.status_code != 200:
+        if resp.status_code != 200 or "_cf_chl_opt" in resp.text:
+            logger.info(f"Benzinga transcripts page unavailable for {sym} (HTTP {resp.status_code})")
             return None
         links = re.findall(r'href="(/[^"]*earnings-call-transcript[^"]*)"', resp.text, re.I)
         links += re.findall(r'href="(https://www\.benzinga\.com/[^"]*transcript[^"]*)"', resp.text, re.I)
@@ -423,7 +443,8 @@ def parse_fool_transcript_article(url: str, fallback_symbol: str) -> Optional[di
         sym = fallback_symbol.upper() or meta["symbol"]
 
         article = (
-            soup.find("div", {"class": re.compile(r"article-body|tailwind-article-body|content", re.I)})
+            soup.find("div", class_="article-body")
+            or soup.find("div", {"class": re.compile(r"^(?:tailwind-)?article-body$", re.I)})
             or soup.find("article")
             or soup.find("main")
             or soup
@@ -527,7 +548,7 @@ def find_fool_transcript_for_symbol(symbol: str) -> Optional[dict]:
                     resp.text,
                     re.I,
                 )
-                for path in matches:
+                for path in sorted(set(matches), reverse=True):
                     if f"-{slug_sym}-" in path.lower():
                         full_url = f"https://www.fool.com{path}"
                         parsed = parse_fool_transcript_article(full_url, sym)
@@ -919,14 +940,17 @@ async def process_company_transcript(
     # 2. Priority 1: Seeking Alpha
     if not t_data:
         t_data = await asyncio.to_thread(find_seeking_alpha_transcript_for_symbol, sym)
+        logger.info(f"[{sym}] Seeking Alpha: {'hit' if t_data else 'miss'}")
 
     # 3. Priority 2: Benzinga
     if not t_data:
         t_data = await asyncio.to_thread(find_benzinga_transcript_for_symbol, sym)
+        logger.info(f"[{sym}] Benzinga: {'hit' if t_data else 'miss'}")
 
     # 4. Priority 3: Motley Fool Live Resolver (Feed + Quote Page + Search)
     if not t_data:
         t_data = await asyncio.to_thread(find_fool_transcript_for_symbol, sym)
+        logger.info(f"[{sym}] Motley Fool: {'hit' if t_data else 'miss'}")
 
     # 3. Tier 2: Yahoo Finance Live Direct Scraper
     if not t_data:
