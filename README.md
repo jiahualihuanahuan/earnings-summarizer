@@ -2,7 +2,7 @@
 
 Local-first S&P 500 earnings call transcript fetcher and AI summarizer.
 
-Pulls recent earnings call transcripts from multiple sources (Seeking Alpha, Benzinga, Motley Fool, Yahoo Finance) and generates concise key-point summaries using a local OpenAI-compatible LLM (default: vLLM serving Qwen/Qwen3-8B-AWQ). Built for Canadian/US passive investors who want structured insights without sending transcripts to the cloud.
+Pulls recent earnings call transcripts from multiple sources (Seeking Alpha, Benzinga, Motley Fool, Yahoo Finance) and generates concise key-point summaries using a local OpenAI-compatible LLM (default: vLLM serving cyankiwi/Qwen3.5-9B-AWQ-4bit as `qwen3.5-9b`). Built for Canadian/US passive investors who want structured insights without sending transcripts to the cloud.
 
 ## Features
 
@@ -18,8 +18,8 @@ Pulls recent earnings call transcripts from multiple sources (Seeking Alpha, Ben
 ## Prerequisites
 
 - Docker & Docker Compose (recommended), **or** Python 3.11+
-- A running [vLLM](https://docs.vllm.ai) (or other OpenAI-compatible) server with model `Qwen/Qwen3-8B-AWQ`
-  - Example start: `vllm serve Qwen/Qwen3-8B-AWQ --port 8001 --api-key vllm-secret-key`
+- A running [vLLM](https://docs.vllm.ai) (or other OpenAI-compatible) server with model `cyankiwi/Qwen3.5-9B-AWQ-4bit` served as `qwen3.5-9b`
+  - Example start: `vllm serve cyankiwi/Qwen3.5-9B-AWQ-4bit --served-model-name qwen3.5-9b --port 8001 --api-key <your-key>`
 - Network access to transcript sites and (optionally) Hugging Face for ticker catalogs
 
 ## Quick Start (Docker)
@@ -50,7 +50,7 @@ pip install -r requirements.txt
 
 export LLM_BASE_URL=http://192.168.86.35:8001/v1
 export LLM_API_KEY=vllm-secret-key
-export LLM_MODEL=Qwen/Qwen3-8B-AWQ
+export LLM_MODEL=qwen3.5-9b
 export SYNC_INTERVAL_HOURS=1
 export DATABASE_PATH=./data/earnings.db
 
@@ -65,7 +65,7 @@ Environment variables:
 |----------|---------|-------------|
 | `LLM_BASE_URL` | `http://192.168.86.35:8001/v1` | Base URL of your OpenAI-compatible vLLM server |
 | `LLM_API_KEY` | `vllm-secret-key` | API key for the vLLM server |
-| `LLM_MODEL` | `Qwen/Qwen3-8B-AWQ` | Model name to use for summarization |
+| `LLM_MODEL` | `qwen3.5-9b` | Model name to use for summarization |
 | `SYNC_INTERVAL_HOURS` | `1` | How often the background S&P 500 sync runs (hours) |
 | `DATABASE_PATH` | `/app/data/earnings.db` | SQLite database path |
 | `HF_TOKEN` | (empty) | Optional Hugging Face token (for higher rate limits) |

@@ -28,7 +28,7 @@ logger = logging.getLogger("earnings-app")
 # Primary LLM: vLLM (OpenAI-compatible API)
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.86.35:8001/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "vllm-secret-key")
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-8B-AWQ")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5-9b")
 # Optional fallback: if OLLAMA_BASE_URL is set, use Ollama's /api/chat instead
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
