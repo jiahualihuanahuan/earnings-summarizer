@@ -5,11 +5,23 @@ services:
     ports:
       - "8085:8000"
     environment:
-      - LLM_BASE_URL=http://192.168.86.35:8001/v1
-      - LLM_API_KEY=vllm-secret-key
-      - LLM_MODEL=qwen3.5-9b
+      # Default: Ollama on the homelab. From inside Docker, use the host LAN IP
+      # (192.168.86.35), not localhost. Ollama must listen on 0.0.0.0, e.g.:
+      #   OLLAMA_HOST=0.0.0.0 OLLAMA_CONTEXT_LENGTH=8192 ollama serve
+      - USE_OLLAMA=true
+      - OLLAMA_BASE_URL=http://192.168.86.35:11434
+      - OLLAMA_MODEL=qwen3.5:9b
+      # Qwen thinking is off by default for faster summaries. Set true to re-enable.
+      - OLLAMA_THINK=false
       - SYNC_INTERVAL_HOURS=1
       - DATABASE_PATH=/app/data/earnings.db
+      # Alternative: switch back to vLLM (OpenAI-compatible) by setting
+      # USE_OLLAMA=false and uncommenting the following (set LLM_API_KEY if
+      # your vLLM server requires one; do not commit secrets):
+      # - USE_OLLAMA=false
+      # - LLM_BASE_URL=http://192.168.86.35:8001/v1
+      # - LLM_MODEL=qwen3.5-9b
+      # - LLM_API_KEY=
     volumes:
       - ./data:/app/data
     restart: unless-stopped

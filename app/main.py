@@ -25,14 +25,23 @@ logging.basicConfig(
 logger = logging.getLogger("earnings-app")
 
 # Configuration
-# Primary LLM: vLLM (OpenAI-compatible API)
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.86.35:8001/v1").rstrip("/")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "vllm-secret-key")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5-9b")
-# Optional fallback: if OLLAMA_BASE_URL is set, use Ollama's /api/chat instead
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/")
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Default LLM: Ollama on the homelab (native /api/chat, no API key).
+# From Docker, use the host LAN IP (192.168.86.35), not localhost.
+# Set USE_OLLAMA=false to switch back to vLLM (OpenAI-compatible /v1).
+USE_OLLAMA = _env_flag("USE_OLLAMA", "true")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.86.35:11434").strip().rstrip("/")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-USE_OLLAMA = bool(OLLAMA_BASE_URL)
+# Disable Qwen thinking mode by default for faster summaries (Ollama "think": false).
+# Set OLLAMA_THINK=true to re-enable. Residual <think> tags are still stripped.
+OLLAMA_THINK = _env_flag("OLLAMA_THINK", "false")
+# Optional vLLM / OpenAI-compatible backend (used when USE_OLLAMA=false)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://192.168.86.35:8001/v1").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.5-9b")
 ACTIVE_LLM_URL = OLLAMA_BASE_URL if USE_OLLAMA else LLM_BASE_URL
 DEFAULT_MODEL = DEFAULT_OLLAMA_MODEL if USE_OLLAMA else LLM_MODEL
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "1"))
@@ -745,7 +754,7 @@ def fetch_transcript_from_parquet(
 
 
 # ---------------------------------------------------------------------------
-# Local LLM Summarizer (vLLM OpenAI-compatible API; optional Ollama fallback)
+# Local LLM Summarizer (Ollama /api/chat by default; optional vLLM OpenAI-compatible)
 # ---------------------------------------------------------------------------
 def _llm_headers() -> dict:
     return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
@@ -794,7 +803,8 @@ async def call_llm(model: str, messages: list) -> str:
                 "model": model,
                 "messages": messages,
                 "stream": False,
-                "options": {"temperature": 0.2, "num_ctx": 16384},
+                "think": OLLAMA_THINK,
+                "options": {"temperature": 0.2, "num_ctx": 8192},
             }
             resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
             resp.raise_for_status()
@@ -867,8 +877,9 @@ async def summarize_with_llm(
     try:
         content = await call_llm(model, messages)
 
+        # Strip Qwen thinking traces if the model still emitted them (e.g. think mode on,
+        # or a vLLM template that only closes </think>).
         clean_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
-        # Qwen3 via vLLM may emit only a closing </think> if the opening tag is in the template
         if "</think>" in clean_content:
             clean_content = clean_content.split("</think>", 1)[1]
         clean_content = clean_content.strip()
